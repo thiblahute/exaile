@@ -37,15 +37,11 @@ import logging.handlers
 import os
 import platform
 import sys
+import pygtkcompat
 
-try:
-    import gio
-except ImportError:
-    # on Win32 using the GStreamer SDK, requires import of
-    # pygtk first
-    import pygtk
-    pygtk.require('2.0')
-    import gio
+pygtkcompat.enable()
+pygtkcompat.enable_gtk()
+from gi.repository import Gst
 
 from xl import common, xdg
 from xl.nls import gettext as _
@@ -79,6 +75,7 @@ class Exaile(object):
         """
             Initializes Exaile.
         """
+        Gst.init(None)
         self.quitting = False
         self.loading = True
         

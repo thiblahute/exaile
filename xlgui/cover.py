@@ -497,7 +497,7 @@ class CoverMenu(guiutil.Menu):
             Initializes the menu
         """
         guiutil.Menu.__init__(self)
-        self.widget = widget
+        self.props.attach_widget = widget
 
         self.append(_('Show Cover'), self.on_show_clicked)
         self.append(_('Fetch Cover'), self.on_fetch_clicked)

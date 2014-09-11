@@ -31,9 +31,9 @@ import os.path
 import sys
 import threading
 
-import pygst
-pygst.require('0.10')
-import gst
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst
 
 import glib
 
@@ -43,41 +43,46 @@ from xl.providers import ProviderHandler
 
 logger = logging.getLogger(__name__)
 
-class MainBin(gst.Bin):
+class MainBin(Gst.Bin):
     """
         The main bin - handles processing and output of audio after it
         is decoded by the engine.
     """
     def __init__(self, player, pre_elems=[]):
-        gst.Bin.__init__(self, name='mainbin-%s' % player._name)
-        
+        Gst.Bin.__init__(self, name='mainbin-%s' % player._name)
+
         self.__player = player
         self._elements = pre_elems[:]
 
         self.pp = Postprocessing(player)
         self._elements.append(self.pp)
 
-        self.tee = gst.element_factory_make("tee")
+        self.tee = Gst.ElementFactory.make("tee")
         self._elements.append(self.tee)
 
-        #self.queue = gst.element_factory_make("queue")
+        #self.queue = Gst.ElementFactory.make("queue")
         #self._elements.append(self.queue)
 
         self.add(*self._elements)
-        gst.element_link_many(*self._elements)
-        
+        for i in range(len(self._elements) - 1):
+            e = self._elements[i]
+            n =  self._elements[i + 1]
+            e.link(n)
+
         self.audio_sink = None
         self.__audio_sink_lock = threading.Lock()
         self.setup_audiosink()
-        
-        self.sinkpad = self._elements[0].get_static_pad("sink")
-        self.add_pad(gst.GhostPad('sink', self.sinkpad))
 
-        self.sinkqueue = gst.element_factory_make("queue")
+        self.sinkpad = self._elements[0].get_static_pad("sink")
+        self.add_pad(Gst.GhostPad('sink', self.sinkpad))
+
+        self.sinkqueue = Gst.ElementFactory.make("queue")
         self.sinkhandler = SinkHandler(player, 'playback_audio_sink')
         self.add(self.sinkhandler)
         self.add(self.sinkqueue)
-        gst.element_link_many(self.tee, self.sinkqueue, self.sinkhandler)
+
+        self.tee.link(self.sinkqueue)
+        self.sinkqueue.link(self.sinkhandler)
 
     def get_volume(self):
         return self.audio_sink.get_volume()
@@ -86,171 +91,174 @@ class MainBin(gst.Bin):
         self.audio_sink.set_volume(vol)
 
     def setup_audiosink(self):
-        
+
         # don't try to switch more than one source at a time
         self.__audio_sink_lock.acquire()
-        
+
         audio_sink = None
         sinkname = settings.get_option("%s/audiosink" % self.__player._name)
-        
-        # Only attempt to autoselect if the user has never specified a 
+        sinkname = "pulsesink"
+
+        # Only attempt to autoselect if the user has never specified a
         # setting manually. Otherwise, they may be confused when it switches
         # to a new output. For example, if they specified a USB device, and
         # it is removed -- when restarting the program, they would not expect
         # to automatically start playing on the builtin sound.
         if sinkname is not None:
             audio_sink = sink_from_preset(self.__player, sinkname)
-            
+
         if not audio_sink:
             if sinkname is not None:
                 logger.warning("Could not enable %s sink for %s, "
                                "attempting to autoselect.", sinkname, self.__player._name)
             audio_sink = sink_from_preset(self.__player, "auto")
-        
+        print audio_sink
+        print sinkname
+
         # If this is the first time we added a sink, just add it to
         # the pipeline and we're done.
-        
+
         if not self.audio_sink:
-        
+
             self._add_audiosink(audio_sink, None)
             self.__audio_sink_lock.release()
             return
-        
+
         old_audio_sink = self.audio_sink
-        
-        
+
+
         # Ok, time to replace the old sink. If it's not in a playing state,
         # then this isn't so bad.
-        
+
         # if we don't use the timeout, when we set it to READY, it may be performing
         # an async wait for PAUSE, so we use the timeout here.
-        
-        state = old_audio_sink.get_state(timeout=50*gst.MSECOND)[1]
-        
-        if state != gst.STATE_PLAYING:
-            
+
+        state = old_audio_sink.get_state(timeout=50*Gst.MSECOND)[1]
+
+        if state != Gst.State.PLAYING:
+
             buffer_position = None
-            
-            if state != gst.STATE_NULL:
+
+            if state != Gst.State.NULL:
                 try:
-                    buffer_position = old_audio_sink.query_position(gst.FORMAT_DEFAULT)
+                    buffer_position = old_audio_sink.query_position(Gst.Format.DEFAULT)
                 except:
                     pass
-            
+
             self.remove(old_audio_sink)
-            
+
             # Now that the old sink is removed, we have to flush it out
-            if old_audio_sink.get_state(timeout=50*gst.MSECOND)[1] == gst.STATE_PAUSED:
+            if old_audio_sink.get_state(timeout=50*Gst.MSECOND)[1] == Gst.STATE_PAUSED:
                 self._clear_old_sink(old_audio_sink)
             else:
-                old_audio_sink.set_state(gst.STATE_NULL)
-        
-            # Then add the new sink    
+                old_audio_sink.set_state(Gst.State.NULL)
+
+            # Then add the new sink
             self._add_audiosink(audio_sink, buffer_position)
-            
+
             self.__audio_sink_lock.release()
             return
-         
-        #  
+
+        #
         # Otherwise, disconnecting the old device is a bit complex. Code is
         # derived from algorithm/code described at the following link:
         #
         # http://gstreamer.freedesktop.org/data/doc/gstreamer/head/manual/html/section-dynamic-pipelines.html
         #
-        
+
         # TODO: Rapid output switching causes problems
-        
+
         # Start off by blocking the src pad of the prior element
         spad = old_audio_sink.get_static_pad('sink').get_peer()
         spad.set_blocked_async(True, self._pad_blocked_cb, audio_sink)
-        
+
     def _pad_blocked_cb(self, pad, info, new_audio_sink):
-                
+
         old_audio_sink = self.audio_sink
-        buffer_position = old_audio_sink.query_position(gst.FORMAT_DEFAULT)
-        
+        buffer_position = old_audio_sink.query_position(Gst.Format.DEFAULT)
+
         # No data is flowing at this point. Unlink the element, add the new one
         self.remove(old_audio_sink)
-        
+
         self._add_audiosink(new_audio_sink, buffer_position)
-        
+
         # GST is holding a lock, so unblock the pad on the main thread so
         # that data continues to flow
-        
+
         def unblock_pad():
             pad.set_blocked(False)
-        
+
         glib.idle_add(unblock_pad)
         self.__audio_sink_lock.release()
-       
+
         # Start flushing the old sink
         self._clear_old_sink(old_audio_sink)
-    
+
     def _clear_old_sink(self, old_audio_sink):
-        
+
         # push EOS into the element, which will be fired once all the
         # data has left the sink
-          
+
         sinkpad = old_audio_sink.get_static_pad('sink')
         self._pad_event_probe_id = sinkpad.add_event_probe(self._event_probe_cb, old_audio_sink)
-        
-        sinkpad.send_event(gst.event_new_eos())
-        
+
+        sinkpad.send_event(Gst.Event.new_eos())
+
         return False
-    
+
     def _event_probe_cb(self, pad, info, audio_sink):
-        
+
         # wait for end of stream marker
-        if info.type != gst.EVENT_EOS:
+        if info.type != Gst.Event.EOS:
             return True
-        
+
         pad.remove_event_probe(self._pad_event_probe_id)
         self._pad_event_probe_id = None
-        
+
         # Get rid of the old sink
-        audio_sink.set_state(gst.STATE_NULL)
-        
+        audio_sink.set_state(Gst.State.NULL)
+
         return False
-    
+
     def _add_audiosink(self, audio_sink, buffer_position):
         '''Sets up the new audiosink and syncs it'''
-        
+
         self.add(audio_sink)
         audio_sink.sync_state_with_parent()
-        gst.element_link_many(self._elements[-1], audio_sink)
+        self._elements[-1].link(audio_sink)
 
         if buffer_position is not None:
-            
+
             # buffer position is the output from get_position. If set, we
             # seek to that position.
-            
+
             # TODO: this actually seems to skip ahead a tiny bit. why?
-            
+
             # Note! this is super important in paused mode too, because when
             #       we switch the sinks around the new sink never goes into
             #       the paused state because there's no buffer. This forces
             #       a resync of the buffer, so things still work.
-            
-            seek_event = gst.event_new_seek(1.0, gst.FORMAT_DEFAULT,
-                gst.SEEK_FLAG_FLUSH, gst.SEEK_TYPE_SET,
+
+            seek_event = Gst.Event.new_seek(1.0, Gst.Format.DEFAULT,
+                Gst.SeekFlag.FLUSH, Gst.SeekType.SET,
                 buffer_position[0],
-                gst.SEEK_TYPE_NONE, 0)
-            
+                Gst.SeekType.NONE, 0)
+
             self.send_event(seek_event)
-        
-        self.audio_sink = audio_sink        
+
+        self.audio_sink = audio_sink
 
 
-class SinkHandler(gst.Bin, ProviderHandler):
+class SinkHandler(Gst.Bin, ProviderHandler):
     def __init__(self, player, servicename):
-        gst.Bin.__init__(self, name=servicename)
+        Gst.Bin.__init__(self, name=servicename)
         ProviderHandler.__init__(self, servicename)
-        self.tee = gst.element_factory_make("tee", "sinkhandler-tee")
+        self.tee = Gst.ElementFactory.make("tee", "sinkhandler-tee")
         self.add(self.tee)
         self.sinkpad = self.tee.get_static_pad("sink")
-        self.sink = gst.GhostPad('sink', self.sinkpad)
+        self.sink = Gst.GhostPad('sink', self.sinkpad)
         self.add_pad(self.sink)
-        self.fake = gst.element_factory_make("fakesink", "sinkhandler-fake")
+        self.fake = Gst.ElementFactory.make("fakesink", "sinkhandler-fake")
         self.fake.props.async = False
         self.add(self.fake)
         self.tee.link(self.fake)
@@ -293,25 +301,23 @@ class SinkHandler(gst.Bin, ProviderHandler):
             pad = queue.get_static_pad("sink").get_peer()
             if pad:
                 self.tee.release_request_pad(pad)
-            try:
-                self.remove(queue)
-                queue.set_state(gst.STATE_NULL)
-            except gst.RemoveError:
-                pass
-            try:
-                self.remove(sink)
-                sink.set_state(gst.STATE_NULL)
-            except gst.RemoveError:
-                pass
+
+            queue.set_state(Gst.STATE_NULL)
+            self.remove(queue)
+
+            sink.set_state(Gst.State.NULL)
+            self.remove(sink)
+
         self.added_sinks = []
 
         for name, sink in self.sinks.iteritems():
             self.add(sink)
-            queue = gst.element_factory_make("queue")
+            queue = Gst.ElementFactory.make("queue")
             self.add(queue)
             self.queuedict[sink.name] = queue
 
-            gst.element_link_many(self.tee, queue, sink)
+            self.tee.link(queue)
+            queue.link(sink)
 
             self.added_sinks.append(sink)
 
@@ -320,14 +326,14 @@ class SinkHandler(gst.Bin, ProviderHandler):
             self.sinkpad.set_blocked_async(False, lambda *args: False, state)
 
     def set_state(self, state):
-        if state == gst.STATE_PLAYING and \
-                self.get_state() == gst.STATE_NULL:
+        if state == Gst.State.PLAYING and \
+                self.get_state() == Gst.State.NULL:
             self.setup_elements()
-        gst.Bin.set_state(self, state)
+        Gst.Element.set_state(self, state)
 
 
 
-class ElementBin(gst.Bin):
+class ElementBin(Gst.Bin):
     """
         A bin for easily containing elements
 
@@ -341,9 +347,9 @@ class ElementBin(gst.Bin):
     """
     def __init__(self, player, name=None):
         if name:
-            gst.Bin.__init__(self, name)
+            Gst.Bin.__init__(self, name)
         else:
-            gst.Bin.__init__(self)
+            Gst.Bin.__init__(self)
         self.player = player
         self.elements = {}
         self.added_elems = []
@@ -358,7 +364,7 @@ class ElementBin(gst.Bin):
         self.setup_elements()
 
     def setup_elements(self):
-        state = self.get_state()[1]
+        state = self.get_state(Gst.CLOCK_TIME_NONE)[1]
 
         if False: #self.srcpad is not None:
             self.srcpad.set_blocked_async(True, self._setup_finish, state)
@@ -374,53 +380,53 @@ class ElementBin(gst.Bin):
 
         if len(self.added_elems) > 0:
             for elem in self.added_elems:
-                try:
-                    self.remove(elem)
-                    elem.set_state(gst.STATE_NULL)
-                except gst.RemoveError:
-                    pass
+                elem.set_state(Gst.State.NULL)
+                self.remove(elem)
 
         elems = list(self.elements.iteritems())
         elems.sort()
         if len(elems) == 0:
-            elems.append(gst.element_factory_make('identity'))
+            elems.append(Gst.ElementFactory.make('identity'))
         else:
             elems = [ x[1] for x in elems ]
         self.add(*elems)
         if len(elems) > 1:
-            gst.element_link_many(*elems)
+            for i in range(len(elems) - 1):
+                e = elems[i]
+                n = elems[i + 1]
+                e.link(n)
 
         self.srcpad = elems[-1].get_static_pad("src")
         if self.src is not None:
             self.src.set_target(self.srcpad)
         else:
-            self.src = gst.GhostPad('src', self.srcpad)
+            self.src = Gst.GhostPad('src', self.srcpad)
             self.add_pad(self.src)
         self.sinkpad = elems[0].get_static_pad("sink")
         if self.sink is not None:
             self.sink.set_target(self.sinkpad)
         else:
-            self.sink = gst.GhostPad('sink', self.sinkpad)
+            self.sink = Gst.GhostPad('sink', self.sinkpad)
             self.add_pad(self.sink)
 
         self.added_elems = elems
 
         self.set_state(state)
-        if blocked:
-            self.srcpad.set_blocked_async(False, lambda *args: False, state)
+        #if blocked:
+        #    self.srcpad.set_blocked_async(False, lambda *args: False, state)
 
     def set_state(self, state):
-        if state == gst.STATE_PLAYING and \
-                self.get_state() == gst.STATE_NULL:
+        if state == Gst.State.PLAYING and \
+                self.get_state() == Gst.State.NULL:
             self.setup_elements()
-        gst.Bin.set_state(self, state)
+        Gst.Bin.set_state(self, state)
 
 
 class ProviderBin(ElementBin, ProviderHandler):
     """
-        A ProviderBin is a gst.Bin that adds and removes elements from itself
+        A ProviderBin is a Gst.Bin that adds and removes elements from itself
         using the providers system. Providers should be a subclass of
-        gst.Element and provide the following attributes:
+        Gst.Element and provide the following attributes:
             name  - name to use for this element
             index - priority within the pipeline. range [0-100] integer.
                     lower numbers are higher priority. elements must
@@ -597,17 +603,22 @@ def sink_enumerate_devices(preset):
     return ret
 
 
-class AudioSink(gst.Bin):
+class AudioSink(Gst.Bin):
     def __init__(self, name, pipeline, player):
-        gst.Bin.__init__(self, name='audiosink-%s-%s' % (name, player._name))
+        print "Hacking up a sink!"
+        Gst.Bin.__init__(self, name='audiosink-%s-%s' % (name, player._name))
         self.name = name
-        self.sink = elems = [gst.parse_launch(elem) for elem in pipeline.split('!')]
+        self.sink = elems = [Gst.parse_launch(elem) for elem in pipeline.split('!')]
+        print pipeline
         self.provided = ProviderBin(player, 'sink_element')
-        self.vol = gst.element_factory_make("volume")
+        self.vol = Gst.ElementFactory.make("volume")
         elems = [self.provided, self.vol] + elems
         self.add(*elems)
-        gst.element_link_many(*elems)
-        self.sinkghost = gst.GhostPad("sink",
+        for i in range(len(elems) - 1):
+            e = elems[i]
+            n = elems[i + 1]
+            e.link(n)
+        self.sinkghost = Gst.GhostPad("sink",
                 self.provided.get_static_pad("sink"))
         self.add_pad(self.sinkghost)
 
